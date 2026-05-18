@@ -886,6 +886,91 @@ function streamSimpleKimi(
 }
 
 // =============================================================================
+// Usage Command
+// =============================================================================
+
+async function fetchKimiUsage(accessToken: string): Promise<Record<string, unknown>> {
+  const response = await fetch(`${getBaseUrl()}/v1/usages`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+      ...getCommonHeaders(),
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Usage request failed: ${response.status} ${text}`);
+  }
+
+  return response.json() as Promise<Record<string, unknown>>;
+}
+
+function formatDuration(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const parts: string[] = [];
+  const days = Math.floor(total / 86_400);
+  if (days) parts.push(`${days}d`);
+  const hours = Math.floor((total % 86_400) / 3_600);
+  if (hours) parts.push(`${hours}h`);
+  const minutes = Math.floor((total % 3_600) / 60);
+  if (minutes) parts.push(`${minutes}m`);
+  const secs = total % 60;
+  if (secs && parts.length === 0) parts.push(`${secs}s`);
+  return parts.join(" ") || "0s";
+}
+
+function formatResetTime(value: string): string {
+  const resetAt = Date.parse(value);
+  if (Number.isNaN(resetAt)) return `resets at ${value}`;
+  const seconds = Math.max(0, Math.floor((resetAt - Date.now()) / 1000));
+  return seconds === 0 ? "reset now" : `resets in ${formatDuration(seconds)}`;
+}
+
+function parseUsageData(data: Record<string, unknown>): string {
+  const rows: string[] = [];
+  
+  // Main usage
+  const usage = data.usage as Record<string, unknown> | undefined;
+  if (usage) {
+    const limit = Number(usage.limit);
+    const used = Number(usage.used);
+    const remaining = Number(usage.remaining);
+    
+    if (!Number.isNaN(limit) || !Number.isNaN(used)) {
+      const actualUsed = !Number.isNaN(used) ? used : (limit - remaining);
+      const pct = limit > 0 ? Math.round((actualUsed / limit) * 100) : 0;
+      rows.push(`Weekly Usage: ${actualUsed} / ${limit} (${pct}%)`);
+    }
+  }
+
+  // Limits
+  const limits = data.limits as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(limits)) {
+    for (const item of limits) {
+      const detail = (item.detail as Record<string, unknown>) ?? item;
+      const name = String(detail.name ?? detail.title ?? item.scope ?? "Limit");
+      const limit = Number(detail.limit);
+      const used = Number(detail.used);
+      
+      if (!Number.isNaN(limit) || !Number.isNaN(used)) {
+        const actualUsed = !Number.isNaN(used) ? used : 0;
+        const pct = limit > 0 ? Math.round((actualUsed / limit) * 100) : 0;
+        rows.push(`${name}: ${actualUsed} / ${limit} (${pct}%)`);
+      }
+
+      // Reset time
+      const resetAt = detail.reset_at ?? detail.resetAt;
+      if (resetAt) {
+        rows.push(`  → ${formatResetTime(String(resetAt))}`);
+      }
+    }
+  }
+
+  return rows.length > 0 ? rows.join("\n") : "No usage data available";
+}
+
+// =============================================================================
 // Extension Entry Point
 // =============================================================================
 
@@ -915,6 +1000,33 @@ export default function (pi: ExtensionAPI) {
       login: loginKimiCode,
       refreshToken: refreshKimiCodeToken,
       getApiKey: (cred) => cred.access,
+    },
+  });
+
+  // Register /kimi:usage command
+  pi.registerCommand("kimi:usage", {
+    description: "Show Kimi Code subscription usage",
+    handler: async (_args, ctx) => {
+      try {
+        // Get current credentials from auth storage
+        const storage = AuthStorage.create();
+        const cred = storage.get("kimi-coding");
+
+        if (!cred || cred.type !== "oauth") {
+          ctx.ui.notify("Not logged in to Kimi. Run /login first.", "error");
+          return;
+        }
+
+        ctx.ui.notify("Fetching usage data...", "info");
+        const data = await fetchKimiUsage(cred.access);
+        const usageText = parseUsageData(data);
+
+        // Show in a dialog
+        ctx.ui.notify(usageText, "info");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Failed to fetch usage: ${message}`, "error");
+      }
     },
   });
 }
